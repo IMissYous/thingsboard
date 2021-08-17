@@ -26,7 +26,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections.CollectionUtils;
 import org.thingsboard.common.util.JacksonUtil;
 import org.thingsboard.common.util.LinkedHashMapRemoveEldest;
-import org.thingsboard.rule.engine.api.RpcError;
 import org.thingsboard.rule.engine.api.msg.DeviceAttributesEventNotificationMsg;
 import org.thingsboard.rule.engine.api.msg.DeviceCredentialsUpdateNotificationMsg;
 import org.thingsboard.rule.engine.api.msg.DeviceEdgeUpdateMsg;
@@ -52,6 +51,7 @@ import org.thingsboard.server.common.data.page.PageLink;
 import org.thingsboard.server.common.data.relation.EntityRelation;
 import org.thingsboard.server.common.data.relation.RelationTypeGroup;
 import org.thingsboard.server.common.data.rpc.Rpc;
+import org.thingsboard.server.common.data.rpc.RpcError;
 import org.thingsboard.server.common.data.rpc.RpcStatus;
 import org.thingsboard.server.common.data.rpc.ToDeviceRpcRequestBody;
 import org.thingsboard.server.common.data.security.DeviceCredentials;
@@ -59,6 +59,7 @@ import org.thingsboard.server.common.data.security.DeviceCredentialsType;
 import org.thingsboard.server.common.msg.TbActorMsg;
 import org.thingsboard.server.common.msg.TbMsgMetaData;
 import org.thingsboard.server.common.msg.queue.TbCallback;
+import org.thingsboard.server.common.msg.rpc.FromDeviceRpcResponse;
 import org.thingsboard.server.common.msg.rpc.ToDeviceRpcRequest;
 import org.thingsboard.server.common.msg.timeout.DeviceActorServerSideRpcTimeoutMsg;
 import org.thingsboard.server.gen.transport.TransportProtos;
@@ -86,8 +87,8 @@ import org.thingsboard.server.gen.transport.TransportProtos.ToTransportMsg;
 import org.thingsboard.server.gen.transport.TransportProtos.ToTransportUpdateCredentialsProto;
 import org.thingsboard.server.gen.transport.TransportProtos.TransportToDeviceActorMsg;
 import org.thingsboard.server.gen.transport.TransportProtos.TsKvProto;
-import org.thingsboard.server.service.rpc.FromDeviceRpcResponse;
 import org.thingsboard.server.service.rpc.FromDeviceRpcResponseActorMsg;
+import org.thingsboard.server.service.rpc.RemoveRpcActorMsg;
 import org.thingsboard.server.service.rpc.ToDeviceRpcRequestActorMsg;
 import org.thingsboard.server.service.transport.msg.TransportToDeviceActorMsgWrapper;
 
@@ -260,6 +261,21 @@ class DeviceActorMessageProcessor extends AbstractContextAwareMsgProcessor {
             systemContext.getTbCoreDeviceRpcService().processRpcResponseFromDeviceActor(responseMsg.getMsg());
         } else {
             log.debug("[{}] Rpc command response [{}] is stale!", deviceId, responseMsg.getRequestId());
+        }
+    }
+
+    void processRemoveRpc(TbActorCtx context, RemoveRpcActorMsg msg) {
+        log.debug("[{}] Processing remove rpc command", msg.getRequestId());
+        Integer requestId = null;
+        for (Map.Entry<Integer, ToDeviceRpcRequestMetadata> entry : toDeviceRpcPendingMap.entrySet()) {
+            if (entry.getValue().getMsg().getMsg().getId().equals(msg.getRequestId())) {
+                requestId = entry.getKey();
+                break;
+            }
+        }
+
+        if (requestId != null) {
+            toDeviceRpcPendingMap.remove(requestId);
         }
     }
 
@@ -535,7 +551,20 @@ class DeviceActorMessageProcessor extends AbstractContextAwareMsgProcessor {
 
     private void processPersistedRpcResponses(TbActorCtx context, SessionInfoProto sessionInfo, ToDevicePersistedRpcResponseMsg responseMsg) {
         UUID rpcId = new UUID(responseMsg.getRequestIdMSB(), responseMsg.getRequestIdLSB());
-        systemContext.getTbRpcService().save(tenantId, new RpcId(rpcId), RpcStatus.valueOf(responseMsg.getStatus()), null);
+        RpcStatus status = RpcStatus.valueOf(responseMsg.getStatus());
+
+        ToDeviceRpcRequestMetadata md;
+        if (RpcStatus.DELIVERED.equals(status)) {
+            md = toDeviceRpcPendingMap.get(responseMsg.getRequestId());
+        } else {
+            md = toDeviceRpcPendingMap.remove(responseMsg.getRequestId());
+        }
+
+        if (md != null) {
+            systemContext.getTbRpcService().save(tenantId, new RpcId(rpcId), status, null);
+        } else {
+            log.info("[{}][{}] Rpc has already removed from pending map.", deviceId, rpcId);
+        }
     }
 
     private void processSubscriptionCommands(TbActorCtx context, SessionInfoProto sessionInfo, SubscribeToAttributeUpdatesMsg subscribeCmd) {
@@ -585,7 +614,7 @@ class DeviceActorMessageProcessor extends AbstractContextAwareMsgProcessor {
                 log.debug("[{}] Received duplicate session open event [{}]", deviceId, sessionId);
                 return;
             }
-            log.info("[{}] Processing new session [{}]. Current sessions size {}", deviceId, sessionId, sessions.size());
+            log.debug("[{}] Processing new session [{}]. Current sessions size {}", deviceId, sessionId, sessions.size());
 
             sessions.put(sessionId, new SessionInfoMetaData(new SessionInfo(SessionType.ASYNC, sessionInfo.getNodeId())));
             if (sessions.size() == 1) {
